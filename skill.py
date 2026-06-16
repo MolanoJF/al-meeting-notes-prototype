@@ -59,10 +59,25 @@ Transcript:
         messages=[{"role": "user", "content": user_message}],
     )
 
-    raw = message.content[0].text.strip()
+    print(f"[skill] stop_reason={message.stop_reason} content_blocks={len(message.content)}")
+
+    text_blocks = [b.text for b in message.content if getattr(b, "type", None) == "text"]
+    raw = "".join(text_blocks).strip()
+    print(f"[skill] raw_response (first 500 chars): {raw[:500]!r}")
+
+    if not raw:
+        raise RuntimeError(
+            f"Claude returned no text content. stop_reason={message.stop_reason}, "
+            f"content_types={[getattr(b, 'type', None) for b in message.content]}"
+        )
+
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
-    return json.loads(raw)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Claude response was not valid JSON: {raw[:500]!r}") from e
