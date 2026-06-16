@@ -7,6 +7,14 @@ import os
 
 from notion_client import Client
 
+# "AL Meetings (Prototype)" database/data source — the only source this
+# pipeline is allowed to read from and write back to. The Notion integration
+# is shared workspace-wide for other Molior skills, so the webhook will
+# receive events for unrelated pages; this scope check keeps us from
+# processing or writing into anything outside this database.
+ALLOWED_DATABASE_ID = "bfc65feb-e3f0-4ef5-b899-87add4e51898"
+ALLOWED_DATA_SOURCE_ID = "882bf29f-eae3-4c97-ad5f-d9f4d45fe172"
+
 
 def _client() -> Client:
     return Client(auth=os.environ["NOTION_API_KEY"])
@@ -15,6 +23,14 @@ def _client() -> Client:
 def read_notion_page(page_id: str) -> dict:
     notion = _client()
     page = notion.pages.retrieve(page_id)
+
+    parent = page.get("parent", {})
+    parent_id = parent.get("database_id") or parent.get("data_source_id")
+    if parent_id not in (ALLOWED_DATABASE_ID, ALLOWED_DATA_SOURCE_ID):
+        raise ValueError(
+            f"Page {page_id} is outside the AL Meetings database (parent: {parent}) — refusing to process"
+        )
+
     blocks = notion.blocks.children.list(page_id)
 
     props = page.get("properties", {})

@@ -139,7 +139,15 @@ async def webhook_notion(request: Request):
     if not page_id:
         raise HTTPException(400, f"Missing page_id in webhook payload. Got keys: {list(body.keys())}")
 
-    return process_notion_page(page_id)
+    # The integration is shared workspace-wide (used by other Molior skills too),
+    # so this webhook receives events for pages well outside the AL Meetings DB.
+    # Anything not retrievable or not actually a meeting page should be skipped,
+    # not crash the request — Notion will retry on repeated failures otherwise.
+    try:
+        return process_notion_page(page_id)
+    except Exception as e:
+        print(f"[webhook/notion] Skipping page {page_id}: {e}")
+        return JSONResponse({"status": "skipped", "page_id": page_id, "reason": str(e)})
 
 
 @app.get("/demo/notion")
