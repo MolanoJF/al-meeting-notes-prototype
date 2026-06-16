@@ -47,6 +47,17 @@ Minimum to run `/webhook/notion`:
 
 Google Drive upload is optional — service degrades gracefully if `GOOGLE_DRIVE_FOLDER_ID` is not set.
 
+Google Drive auth uses OAuth user credentials (same grant as the `gws` CLI) — `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN` — not a service account.
+
+## Notion setup (Workflow B)
+
+The "AL Meetings (Prototype)" database lives under the Ackroyd Lowrie client page in Notion. Two manual steps not doable via API:
+
+1. **Create a Notion integration token** at notion.so/my-integrations → "New integration" → internal → copy the secret → set as `NOTION_API_KEY` in Render. Then open the AL Meetings database in Notion → "..." menu → Connections → add the integration.
+2. **Set up the native automation**: open the database → Automations → New automation → Trigger: "Status" is "Ready" → Action: "Send webhook" → URL: `https://<your-render-url>/webhook/notion`.
+
+Notion's exact webhook payload shape for this trigger isn't confirmed yet — `/webhook/notion` logs the raw payload on first call so we can adjust the page-ID extraction once we see a real one.
+
 ## Production swaps
 
 | Prototype | Production |

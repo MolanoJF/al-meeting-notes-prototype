@@ -86,11 +86,19 @@ def demo_granola():
 @app.post("/webhook/notion")
 async def webhook_notion(request: Request):
     body = await request.json()
+    print(f"[webhook/notion] raw payload: {body}")
 
-    # Notion sends the page ID either at top level or nested under data
-    page_id = body.get("page_id") or (body.get("data") or {}).get("id")
+    # Notion's exact webhook shape isn't confirmed yet for this automation type —
+    # try the common locations, log raw payload above so we can adjust once we see a real one.
+    page_id = (
+        body.get("page_id")
+        or body.get("id")
+        or (body.get("data") or {}).get("id")
+        or (body.get("page") or {}).get("id")
+        or (body.get("source") or {}).get("page_id")
+    )
     if not page_id:
-        raise HTTPException(400, "Missing page_id in webhook payload")
+        raise HTTPException(400, f"Missing page_id in webhook payload. Got keys: {list(body.keys())}")
 
     page_data = read_notion_page(page_id)
     transcript = extract_transcript(page_data["blocks"])
