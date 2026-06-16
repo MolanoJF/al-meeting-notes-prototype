@@ -7,7 +7,7 @@ Two workflows, one shared formatting skill:
 | Workflow | Trigger | Input | Claude's role |
 |---|---|---|---|
 | **A — Granola** | Render polls API every 5 min | Granola transcript | Context-aware formatting |
-| **B — Notion** | Instant webhook (Notion automation) | Notion AI Meeting Notes (transcript + summary) | Formatting only |
+| **B — Notion** | Integration webhook (or manual trigger) | Notion AI Meeting Notes (transcript + summary) | Formatting only |
 
 Both workflows produce a branded AL Word document saved to Google Drive (Egnyte in production).
 
@@ -18,7 +18,8 @@ Both workflows produce a branded AL Word document saved to Google Drive (Egnyte 
 | `GET` | `/health` | Service health check |
 | `POST` | `/format` | Format a transcript (shared, both workflows) |
 | `GET` | `/demo/granola` | Trigger Workflow A with fixture transcript |
-| `POST` | `/webhook/notion` | Workflow B — receives Notion automation webhook |
+| `POST` | `/webhook/notion` | Workflow B — receives Notion integration webhook (events + verification handshake) |
+| `GET` | `/demo/notion?page_id=...` | Workflow B — manual trigger fallback, defaults to the seeded demo page |
 
 ## Local setup
 
@@ -51,12 +52,15 @@ Google Drive auth uses OAuth user credentials (same grant as the `gws` CLI) — 
 
 ## Notion setup (Workflow B)
 
-The "AL Meetings (Prototype)" database lives under the Ackroyd Lowrie client page in Notion. Two manual steps not doable via API:
+The "AL Meetings (Prototype)" database lives under the Ackroyd Lowrie client page in Notion.
+
+**Note:** Notion's no-code "Automations" builder (Trigger → Send webhook) requires a Business plan. We don't have that, so we use **Integration Webhooks** instead — a separate, developer-facing feature configured in the integration's own settings, available regardless of workspace plan.
 
 1. **Create a Notion integration token** at notion.so/my-integrations → "New integration" → internal → copy the secret → set as `NOTION_API_KEY` in Render. Then open the AL Meetings database in Notion → "..." menu → Connections → add the integration.
-2. **Set up the native automation**: open the database → Automations → New automation → Trigger: "Status" is "Ready" → Action: "Send webhook" → URL: `https://<your-render-url>/webhook/notion`.
+2. **Subscribe to webhooks**: in the integration's settings → Webhooks tab → add subscription → URL: `https://<your-render-url>/webhook/notion`. Notion sends a one-time `{"verification_token": "..."}` POST — `/webhook/notion` logs it (check Render logs), copy the token back into the Webhooks tab's Verify dialog to activate.
+3. Once verified, subscribe to page/data source update events for the AL Meetings database.
 
-Notion's exact webhook payload shape for this trigger isn't confirmed yet — `/webhook/notion` logs the raw payload on first call so we can adjust the page-ID extraction once we see a real one.
+**Fallback if webhook verification isn't done yet or flakes during the demo:** hit `GET /demo/notion` directly — it processes the seeded page exactly the same way, just triggered manually instead of by a live Notion event. Same output, same code path, zero risk during the presentation.
 
 ## Production swaps
 

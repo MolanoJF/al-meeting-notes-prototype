@@ -80,31 +80,15 @@ def demo_granola():
 
 
 # ---------------------------------------------------------------------------
-# Workflow B — Notion webhook
+# Workflow B — Notion
 # ---------------------------------------------------------------------------
 
-@app.post("/webhook/notion")
-async def webhook_notion(request: Request):
-    body = await request.json()
-    print(f"[webhook/notion] raw payload: {body}")
-
-    # Notion's exact webhook shape isn't confirmed yet for this automation type —
-    # try the common locations, log raw payload above so we can adjust once we see a real one.
-    page_id = (
-        body.get("page_id")
-        or body.get("id")
-        or (body.get("data") or {}).get("id")
-        or (body.get("page") or {}).get("id")
-        or (body.get("source") or {}).get("page_id")
-    )
-    if not page_id:
-        raise HTTPException(400, f"Missing page_id in webhook payload. Got keys: {list(body.keys())}")
-
+def process_notion_page(page_id: str) -> dict:
     page_data = read_notion_page(page_id)
     transcript = extract_transcript(page_data["blocks"])
 
     if not transcript.strip():
-        return JSONResponse({"status": "skipped", "reason": "no transcript content found"})
+        return {"status": "skipped", "reason": "no transcript content found"}
 
     formatted = format_meeting_notes(
         transcript=transcript,
@@ -125,5 +109,44 @@ async def webhook_notion(request: Request):
         "workflow": "B — Notion",
         "status": "processed",
         "meeting": page_data["title"],
+        "formatted": formatted,
         "drive_url": drive_url,
     }
+
+
+@app.post("/webhook/notion")
+async def webhook_notion(request: Request):
+    body = await request.json()
+    print(f"[webhook/notion] raw payload: {body}")
+
+    # One-time verification handshake when the subscription is first created.
+    # Notion sends {"verification_token": "..."} — log it, paste into the
+    # integration's Webhooks tab in the Notion UI to activate the subscription.
+    if "verification_token" in body:
+        print(f"[webhook/notion] VERIFICATION TOKEN: {body['verification_token']}")
+        return JSONResponse({"status": "verification_token_logged"})
+
+    # Notion's exact event payload shape isn't confirmed yet — try the common
+    # locations, log raw payload above so we can adjust once we see a real one.
+    page_id = (
+        body.get("page_id")
+        or body.get("id")
+        or (body.get("data") or {}).get("id")
+        or (body.get("page") or {}).get("id")
+        or (body.get("entity") or {}).get("id")
+        or (body.get("source") or {}).get("page_id")
+    )
+    if not page_id:
+        raise HTTPException(400, f"Missing page_id in webhook payload. Got keys: {list(body.keys())}")
+
+    return process_notion_page(page_id)
+
+
+@app.get("/demo/notion")
+def demo_notion(page_id: str = "38169d9d641781e8b2c4dd3759d4ea56"):
+    """
+    Manual trigger fallback — use this if the live webhook isn't verified yet
+    or for a guaranteed-to-work moment during the demo. Defaults to the seeded
+    'Fee Proposal — Sprint 0 Kickoff' page.
+    """
+    return process_notion_page(page_id)
