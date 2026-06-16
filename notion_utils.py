@@ -91,6 +91,7 @@ def write_summary_to_notion(page_id: str, formatted: dict):
         children.append(_text_block("Next Meeting", next_mtg))
 
     notion.blocks.children.append(page_id, children=children)
+    notion.pages.update(page_id, properties={"Status": {"select": {"name": "Processed"}}})
 
 
 def _text_block(heading: str, body: str) -> dict:
