@@ -17,7 +17,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Mm, Emu
 
-HEADING_COLOR = RGBColor(0x1F, 0x29, 0x37)   # dark gray-black, matches reference Heading 1
+HEADING_COLOR = RGBColor(0x00, 0x00, 0x00)   # pure black, per Felipe's request
+TITLE_COLOR = RGBColor(0x00, 0x00, 0x00)     # pure black
 SUBTITLE_COLOR = RGBColor(0x6B, 0x72, 0x80)  # slate gray, matches reference intro paragraph
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "al_logo.jpg")
@@ -47,6 +48,7 @@ def _style_title(doc: Document):
     title.font.name = "Arial"
     title.font.size = Pt(28)
     title.font.bold = False
+    title.font.color.rgb = TITLE_COLOR
 
 
 def _style_heading1(doc: Document):
