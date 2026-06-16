@@ -60,4 +60,9 @@ Transcript:
     )
 
     raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
     return json.loads(raw)

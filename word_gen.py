@@ -9,8 +9,7 @@ from datetime import datetime
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor, Inches
+from docx.shared import Pt, RGBColor
 
 
 AL_BRAND_COLOR = RGBColor(0x1A, 0x1A, 0x2E)   # dark navy — update to AL brand hex
@@ -20,8 +19,8 @@ AL_ACCENT_COLOR = RGBColor(0x4A, 0x4A, 0x8A)
 def _add_header(doc: Document, date: str, project: str):
     section = doc.sections[0]
     header = section.header
+    # No style assigned — default python-docx tables have no visible borders
     htable = header.add_table(1, 2, width=section.page_width - section.left_margin - section.right_margin)
-    htable.style = "Table Grid"
     htable.cell(0, 0).text = "Ackroyd Lowrie Architects"
     htable.cell(0, 1).text = f"{project}\n{date}"
     htable.cell(0, 1).paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.RIGHT
@@ -31,16 +30,6 @@ def _add_header(doc: Document, date: str, project: str):
             for run in para.runs:
                 run.font.size = Pt(9)
                 run.font.color.rgb = AL_BRAND_COLOR
-
-    # Remove table borders from header
-    for row in htable.rows:
-        for cell in row.cells:
-            tc = cell._tc
-            tcPr = tc.get_or_add_tcPr()
-            tcBorders = tcPr.get_or_add_tcBorders()
-            for border in ["top", "left", "bottom", "right", "insideH", "insideV"]:
-                el = tcBorders.get_or_add(qn(f"w:{border}"))
-                el.set(qn("w:val"), "none")
 
 
 def _add_footer(doc: Document, date: str):
