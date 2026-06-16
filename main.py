@@ -83,8 +83,16 @@ def demo_granola():
 # Workflow B — Notion
 # ---------------------------------------------------------------------------
 
-def process_notion_page(page_id: str) -> dict:
+def process_notion_page(page_id: str, require_ready: bool = True) -> dict:
     page_data = read_notion_page(page_id)
+
+    # Guard against infinite loops: our own write-back (content + Status -> Processed)
+    # triggers new webhook events for this same page. Only Status == "Ready" should
+    # actually kick off processing — once we flip it to "Processed", later events
+    # for this page (including ones we caused) are no-ops.
+    if require_ready and page_data["status"].lower() != "ready":
+        return {"status": "skipped", "reason": f"Status is '{page_data['status']}', not 'Ready'"}
+
     transcript = extract_transcript(page_data["blocks"])
 
     if not transcript.strip():
@@ -126,18 +134,19 @@ async def webhook_notion(request: Request):
         print(f"[webhook/notion] VERIFICATION TOKEN: {body['verification_token']}")
         return JSONResponse({"status": "verification_token_logged"})
 
-    # Notion's exact event payload shape isn't confirmed yet — try the common
-    # locations, log raw payload above so we can adjust once we see a real one.
-    page_id = (
-        body.get("page_id")
-        or body.get("id")
-        or (body.get("data") or {}).get("id")
-        or (body.get("page") or {}).get("id")
-        or (body.get("entity") or {}).get("id")
-        or (body.get("source") or {}).get("page_id")
-    )
+    # Confirmed real shape: {"entity": {"id": "<page_id>", "type": "page"}, "type": "page.properties_updated" | "page.content_updated", ...}
+    # body["id"] is the EVENT DELIVERY ID, not the page — do not use it as a page_id fallback.
+    entity = body.get("entity") or {}
+    page_id = entity.get("id") if entity.get("type") == "page" else None
+
     if not page_id:
-        raise HTTPException(400, f"Missing page_id in webhook payload. Got keys: {list(body.keys())}")
+        print(f"[webhook/notion] No page entity in payload, skipping. Keys: {list(body.keys())}")
+        return JSONResponse({"status": "skipped", "reason": "no page entity in payload"})
+
+    event_type = body.get("type", "")
+    if event_type not in ("page.properties_updated", "page.content_updated", "page.created"):
+        print(f"[webhook/notion] Ignoring event type: {event_type}")
+        return JSONResponse({"status": "skipped", "reason": f"event type {event_type} not relevant"})
 
     # The integration is shared workspace-wide (used by other Molior skills too),
     # so this webhook receives events for pages well outside the AL Meetings DB.
@@ -155,6 +164,7 @@ def demo_notion(page_id: str = "38169d9d641781e8b2c4dd3759d4ea56"):
     """
     Manual trigger fallback — use this if the live webhook isn't verified yet
     or for a guaranteed-to-work moment during the demo. Defaults to the seeded
-    'Fee Proposal — Sprint 0 Kickoff' page.
+    'Fee Proposal — Sprint 0 Kickoff' page. Bypasses the Status == 'Ready' guard
+    since this is an explicit, deliberate trigger.
     """
-    return process_notion_page(page_id)
+    return process_notion_page(page_id, require_ready=False)

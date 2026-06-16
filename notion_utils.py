@@ -53,11 +53,16 @@ def read_notion_page(page_id: str) -> dict:
         raw = props["Meeting type"]["select"].get("name", "internal")
         meeting_type = "client-facing" if "client" in raw.lower() else "internal"
 
+    status = ""
+    if props.get("Status") and props["Status"].get("select"):
+        status = props["Status"]["select"].get("name", "")
+
     return {
         "title": title,
         "date": date,
         "attendees": attendees,
         "meeting_type": meeting_type,
+        "status": status,
         "blocks": blocks,
     }
 
