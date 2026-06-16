@@ -1,30 +1,42 @@
 """
 Uploads a Word doc to Google Drive.
 Prototype stand-in for Egnyte — swap this module for egnyte.py in production.
-Requires: GOOGLE_DRIVE_FOLDER_ID and GOOGLE_CREDENTIALS_JSON env vars.
+
+Uses OAuth2 user credentials (same Workspace account as the `gws` CLI),
+not a service account — this puts uploads in the operator's actual Drive.
+Requires: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
+GOOGLE_OAUTH_REFRESH_TOKEN, GOOGLE_DRIVE_FOLDER_ID env vars.
 """
 
-import base64
-import json
 import os
-import tempfile
 
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-
-
 def _get_drive_service():
-    creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-    if not creds_b64:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var not set")
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
 
-    creds_json = base64.b64decode(creds_b64).decode("utf-8")
-    creds_info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    if not all([client_id, client_secret, refresh_token]):
+        raise RuntimeError(
+            "Missing one of GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET / GOOGLE_OAUTH_REFRESH_TOKEN"
+        )
+
+    # No `scopes` passed here on purpose — this is an existing refresh token
+    # (shared with the gws CLI) already bound to whatever scopes it was granted.
+    # Requesting a different/narrower scope on refresh causes invalid_scope.
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
 
@@ -34,9 +46,10 @@ def upload_to_drive(local_path: str, meeting_title: str, date: str) -> str | Non
         print("[drive] GOOGLE_DRIVE_FOLDER_ID not set — skipping upload")
         return None
 
+    url = None
     try:
         service = _get_drive_service()
-        file_name = f"{date} — {meeting_title}.docx"
+        file_name = f"{date} - {meeting_title}.docx"
         file_metadata = {
             "name": file_name,
             "parents": [folder_id],
@@ -48,11 +61,13 @@ def upload_to_drive(local_path: str, meeting_title: str, date: str) -> str | Non
         )
         uploaded = service.files().create(body=file_metadata, media_body=media, fields="id,webViewLink").execute()
         url = uploaded.get("webViewLink", "")
-        print(f"[drive] Uploaded: {file_name} → {url}")
-        return url
+        print(f"[drive] Uploaded: {file_name} -> {url}")
     except Exception as e:
         print(f"[drive] Upload failed: {e}")
-        return None
     finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass  # file handle still released by OS; not worth failing the request over
+    return url
