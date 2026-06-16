@@ -1,15 +1,51 @@
 # AL Meeting Notes Automation
 
-Prototype for Ackroyd Lowrie × Molior — automated meeting notes pipeline.
+**A working prototype for Ackroyd Lowrie × Molior.**
 
-Two workflows, one shared formatting skill:
+Every AL meeting currently needs someone to write up what was decided, track who owns what action and by when, file a document in the right project folder, and share action items with attendees. This automates that, end to end — no one types up notes again.
 
-| Workflow | Trigger | Input | Claude's role |
-|---|---|---|---|
-| **A — Granola** | Render polls API every 5 min | Granola transcript | Context-aware formatting |
-| **B — Notion** | Integration webhook (or manual trigger) | Notion AI Meeting Notes (transcript + summary) | Formatting only |
+This repo contains a real, deployed service. Two different ways to trigger it are demonstrated here — not slideware, not mockups. Both produce the same branded AL Word document automatically.
 
-Both workflows produce a branded AL Word document saved to Google Drive (Egnyte in production).
+📊 **Diagrams:** [`diagrams/Workflow A — Granola-Native Pipeline.pdf`](diagrams/Workflow%20A%20%E2%80%94%20Granola-Native%20Pipeline.pdf) · [`diagrams/Workflow B — Notion-Native Pipeline.pdf`](diagrams/Workflow%20B%20%E2%80%94%20Notion-Native%20Pipeline.pdf)
+
+🎬 **Presenting this?** See [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for the full run-of-show.
+
+---
+
+## What it does
+
+Two different triggers — a Granola recording, or a Notion meeting page — both flow into the same pipeline:
+
+1. **Claude reads the transcript** and extracts what matters: a summary, the key decisions made, action items (who owns what, by when), risks worth flagging, and the next meeting date.
+2. **A branded Word document is built automatically** — AL logo, AL fonts, AL formatting. No template to fill in by hand.
+3. **The finished document lands in Drive** (Egnyte in production), named and filed automatically. For Workflow B, the same structured summary is also written back into the Notion page itself.
+
+Nobody copies text across documents. Nobody formats anything. Nobody has to remember to do it.
+
+---
+
+## The two workflows
+
+| | Workflow A — Granola | Workflow B — Notion |
+|---|---|---|
+| **Trigger** | Render polls Granola's API every 5 min | Notion fires a webhook the instant a meeting is marked ready |
+| **Input** | Granola's auto-recorded transcript | Notion AI Meeting Notes — auto-recorded transcript + first-pass summary |
+| **Claude's job** | Extract structure from a raw transcript, with project context injected from Supabase | Lighter — Notion's already done some of the structuring; Claude formats it to AL standard |
+| **Where the record lives** | Egnyte only | Notion (source of truth) + Egnyte (client-facing docs) |
+| **Best fit if…** | AL stays with its current toolset | AL commits to Notion as the project hub |
+
+Full architecture, every step, in the [diagrams](diagrams/).
+
+---
+
+## See it live
+
+| | |
+|---|---|
+| **Service** | `https://al-meeting-notes.onrender.com` |
+| **Workflow A demo** | `GET /demo/granola` — runs the fixture transcript through the full pipeline |
+| **Workflow B demo** | `GET /demo/notion` — runs the seeded Notion page through the full pipeline |
+| **Workflow B live** | Flip `Status` → `Ready` on a page in the "AL Meetings (Prototype)" Notion database — the webhook does the rest, no manual trigger needed |
 
 ## Endpoints
 
@@ -20,6 +56,8 @@ Both workflows produce a branded AL Word document saved to Google Drive (Egnyte 
 | `GET` | `/demo/granola` | Trigger Workflow A with fixture transcript |
 | `POST` | `/webhook/notion` | Workflow B — receives Notion integration webhook (events + verification handshake) |
 | `GET` | `/demo/notion?page_id=...` | Workflow B — manual trigger fallback, defaults to the seeded demo page |
+
+---
 
 ## Local setup
 
@@ -81,5 +119,11 @@ drive.py             # Google Drive upload
 notion_utils.py      # Notion API helpers (Workflow B)
 fixtures/
   sample_transcript.json   # AL-flavored mock transcript
+diagrams/
+  Workflow A — Granola-Native Pipeline.pdf
+  Workflow B — Notion-Native Pipeline.pdf
+assets/
+  al_logo.jpg         # extracted from AL's reference document, used in generated docs
 render.yaml          # Render deployment config
+DEMO_SCRIPT.md        # presentation run-of-show
 ```
