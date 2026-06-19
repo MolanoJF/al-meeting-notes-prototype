@@ -37,8 +37,9 @@ def process_interaction(interaction_page_id: str) -> dict:
     """
     Full pipeline for one INTERACTIONS DB entry:
 
-    1. Read the entry — skip if already ingested or no meeting URL in Notes.
-    2. Fetch the Notion meeting recording page from the URL in Notes.
+    1. Read the entry — skip if already ingested.
+    2. Read the entry page's own blocks first (meeting recording moved into DB).
+       Fall back to fetching a separate page via URL in the Notes field.
     3. Parse Notion's AI summary into sections.
     4. Generate AL-branded Word doc.
     5. Upload to Google Drive.
@@ -49,14 +50,12 @@ def process_interaction(interaction_page_id: str) -> dict:
     if entry["ingested"]:
         return {"status": "skipped", "reason": "already ingested"}
 
-    meeting_page_id = entry["meeting_page_id"]
-    if not meeting_page_id:
-        return {
-            "status": "skipped",
-            "reason": "no Notion meeting URL found in Notes field",
-        }
+    # Primary: the INTERACTIONS entry IS the meeting recording page
+    meeting = fetch_meeting_page(interaction_page_id)
 
-    meeting = fetch_meeting_page(meeting_page_id)
+    # Fallback: a separate meeting recording URL was pasted into Notes
+    if not meeting["blocks"] and entry["meeting_page_id"]:
+        meeting = fetch_meeting_page(entry["meeting_page_id"])
 
     summary_data = extract_meeting_summary(meeting["blocks"])
 
@@ -110,8 +109,13 @@ async def webhook_notion(request: Request):
     if not page_id:
         return JSONResponse({"status": "skipped", "reason": "no page entity in payload"})
 
-    # We care about new pages and property updates (Notes URL may be added after creation)
-    if event_type not in ("page.created", "page.properties_updated", "page.content_updated"):
+    # page.parent_changed fires when a page is moved into the DB
+    if event_type not in (
+        "page.created",
+        "page.parent_changed",
+        "page.properties_updated",
+        "page.content_updated",
+    ):
         return JSONResponse({"status": "skipped", "reason": f"event type {event_type} not relevant"})
 
     try:
