@@ -206,11 +206,14 @@ def extract_meeting_summary(blocks: list) -> dict:
     sections: list[dict] = []
     current_heading: str | None = None
     current_lines: list[str] = []
+    past_action_items = False
 
     def flush():
-        nonlocal current_heading, current_lines
+        nonlocal current_heading, current_lines, past_action_items
         if current_heading and current_lines:
             is_actions = any(kw in current_heading.lower() for kw in _ACTION_KEYWORDS)
+            if is_actions:
+                past_action_items = True
             sections.append({
                 "heading": current_heading,
                 "lines": list(current_lines),
@@ -224,6 +227,9 @@ def extract_meeting_summary(blocks: list) -> dict:
 
         if btype in _HEADING_TYPES:
             flush()
+            # First heading after action items = start of notes/transcript — stop.
+            if past_action_items:
+                break
             text = _rt_to_str(block.get(btype, {}).get("rich_text", []))
             if text:
                 current_heading = text
@@ -239,9 +245,6 @@ def extract_meeting_summary(blocks: list) -> dict:
                 if current_heading is None:
                     current_heading = "Action Items"
                 current_lines.append(text)
-
-        # meeting_notes / synced_block / column_list containers are skipped here;
-        # their children are already in the flat list from _blocks_recursive.
 
     flush()
 
