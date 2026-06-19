@@ -16,6 +16,7 @@ from datetime import datetime
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Mm, Emu
 
@@ -86,16 +87,28 @@ def _add_header_logo(doc: Document):
         run.add_picture(LOGO_PATH, width=Emu(LOGO_WIDTH_EMU), height=Emu(LOGO_HEIGHT_EMU))
 
 
+def _set_cell_shading(cell, hex_fill: str):
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_fill)
+    tcPr.append(shd)
+
+
 def _add_action_table(doc: Document, action_items: list):
     table = doc.add_table(rows=1, cols=3)
-    table.style = "Light Shading Accent 1"
+    table.style = "Table Grid"
     hdr = table.rows[0].cells
     hdr[0].text = "WHO"
     hdr[1].text = "WHAT"
     hdr[2].text = "BY WHEN"
     for cell in hdr:
+        _set_cell_shading(cell, "E5E7EB")   # light grey header
         for run in cell.paragraphs[0].runs:
             run.font.name = "Arial"
+            run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
             run.bold = True
 
     for item in action_items:
@@ -110,6 +123,7 @@ def _add_action_table(doc: Document, action_items: list):
                 for run in para.runs:
                     run.font.name = "Arial"
                     run.font.size = Pt(10)
+                    run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
 
 
 def generate_word_doc(summary_data: dict, meeting_meta: dict) -> str:

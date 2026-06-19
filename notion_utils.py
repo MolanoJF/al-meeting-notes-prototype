@@ -105,8 +105,8 @@ def read_interaction_entry(page_id: str) -> dict:
 # Fetch meeting recording page
 # ---------------------------------------------------------------------------
 
-def _blocks_recursive(notion: Client, block_id: str, depth: int = 0) -> list:
-    """Walk the block tree up to 4 levels deep (meeting-notes blocks nest deeply)."""
+def _blocks_flat(notion: Client, block_id: str, depth: int = 0) -> list:
+    """Recursively fetch all child blocks (plain — no meeting_notes special-casing)."""
     if depth > 4:
         return []
     blocks = []
@@ -119,22 +119,39 @@ def _blocks_recursive(notion: Client, block_id: str, depth: int = 0) -> list:
         for block in resp.get("results", []):
             blocks.append(block)
             if block.get("has_children"):
-                blocks.extend(_blocks_recursive(notion, block["id"], depth + 1))
+                blocks.extend(_blocks_flat(notion, block["id"], depth + 1))
         if not resp.get("has_more"):
             break
         cursor = resp["next_cursor"]
     return blocks
 
 
+def _summary_blocks_from_meeting_notes(notion: Client, meeting_notes_block_id: str) -> list:
+    """
+    Return only the AI summary child blocks of a meeting_notes block.
+
+    Notion meeting recording pages have three children under the meeting_notes
+    block: (1) AI summary, (2) notes, (3) transcript. We only want (1).
+    """
+    resp = notion.blocks.children.list(block_id=meeting_notes_block_id)
+    children = resp.get("results", [])
+    if not children:
+        return []
+    summary_block = children[0]          # first child = AI summary section
+    blocks = [summary_block]
+    if summary_block.get("has_children"):
+        blocks.extend(_blocks_flat(notion, summary_block["id"]))
+    return blocks
+
+
 def fetch_meeting_page(page_id: str) -> dict:
     """
     Fetch a Notion meeting recording page.
+    Only the AI-generated summary section is extracted — not notes or transcript.
 
     Returns:
-        title       str  — page title
-        date        str  — date from title mention or ""
-        attendees   list[str] — names from meeting-notes attendees metadata (best-effort)
-        blocks      list — all blocks (recursively fetched, including nested meeting-notes)
+        title  str  — page title
+        blocks list — summary blocks only
     """
     notion = _client()
     page = notion.pages.retrieve(page_id)
@@ -147,8 +164,18 @@ def fetch_meeting_page(page_id: str) -> dict:
                 title += rt.get("plain_text", "")
             break
 
-    blocks = _blocks_recursive(notion, page_id)
-    return {"title": title, "blocks": blocks}
+    # Walk top-level blocks; for meeting_notes blocks, only descend into summary
+    top = notion.blocks.children.list(block_id=page_id)
+    all_blocks: list = []
+    for block in top.get("results", []):
+        btype = block.get("type", "")
+        all_blocks.append(block)
+        if btype == "meeting_notes" and block.get("has_children"):
+            all_blocks.extend(_summary_blocks_from_meeting_notes(notion, block["id"]))
+        elif block.get("has_children"):
+            all_blocks.extend(_blocks_flat(notion, block["id"]))
+
+    return {"title": title, "blocks": all_blocks}
 
 
 # ---------------------------------------------------------------------------
