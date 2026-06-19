@@ -235,11 +235,20 @@ def extract_meeting_summary(blocks: list) -> dict:
                 current_heading = text
 
         elif btype in _CONTENT_TYPES:
+            # Skip paragraphs/bullets under an action items heading — transcript
+            # bleeds in as paragraph blocks directly after the to_do items.
+            if current_heading is not None and any(
+                kw in current_heading.lower() for kw in _ACTION_KEYWORDS
+            ):
+                continue
             text = _rt_to_str(block.get(btype, {}).get("rich_text", []))
             if text and current_heading is not None:
                 current_lines.append(text)
 
         elif btype == "to_do":
+            # Once we're past action items, stop — no more to_do blocks expected.
+            if past_action_items:
+                break
             text = _rt_to_str(block.get("to_do", {}).get("rich_text", []))
             if text:
                 if current_heading is None:
