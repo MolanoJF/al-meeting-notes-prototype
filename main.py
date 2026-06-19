@@ -11,7 +11,9 @@ from notion_utils import (
     fetch_meeting_page,
     mark_as_ingested,
     read_interaction_entry,
+    update_interaction_fields,
 )
+from skill import enrich_interaction_fields
 from word_gen import generate_word_doc
 
 
@@ -77,6 +79,18 @@ def process_interaction(interaction_page_id: str) -> dict:
     doc_path  = generate_word_doc(summary_data, meeting_meta)
     drive_url = upload_to_drive(doc_path, title, entry["date"])
 
+    # Enrich INTERACTIONS entry fields from meeting content
+    crm_fields: dict = {}
+    try:
+        crm_fields = enrich_interaction_fields(
+            meeting_title=meeting["title"] or title,
+            raw_summary=summary_data["raw_summary"],
+        )
+        update_interaction_fields(interaction_page_id, crm_fields)
+        print(f"[enrich] updated fields: {crm_fields}")
+    except Exception as e:
+        print(f"[enrich] non-fatal error — fields not updated: {e}")
+
     mark_as_ingested(interaction_page_id, drive_url)
 
     return {
@@ -85,6 +99,7 @@ def process_interaction(interaction_page_id: str) -> dict:
         "sections": len(summary_data["sections"]),
         "action_items": len(summary_data["action_items"]),
         "drive_url": drive_url,
+        "crm_fields": crm_fields,
     }
 
 

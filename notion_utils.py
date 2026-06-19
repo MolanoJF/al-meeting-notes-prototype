@@ -284,3 +284,34 @@ def mark_as_ingested(page_id: str, drive_url: str | None = None):
     if drive_url:
         properties["Drive URL"] = {"url": drive_url}
     notion.pages.update(page_id, properties=properties)
+
+
+def update_interaction_fields(page_id: str, fields: dict):
+    """
+    Write enriched CRM fields back to an INTERACTIONS entry.
+
+    fields keys (all optional):
+        date      str  — YYYY-MM-DD
+        type      str  — must match a Type select option
+        stage     str  — must match a Stage at Time select option
+        crm_note  str  — text for the Notes field
+    """
+    notion = _client()
+    properties: dict = {}
+
+    if fields.get("date"):
+        properties["Date"] = {"date": {"start": fields["date"]}}
+
+    if fields.get("type"):
+        properties["Type"] = {"select": {"name": fields["type"]}}
+
+    if fields.get("stage"):
+        properties["Stage at Time"] = {"select": {"name": fields["stage"]}}
+
+    if fields.get("crm_note"):
+        properties["Notes"] = {
+            "rich_text": [{"type": "text", "text": {"content": fields["crm_note"]}}]
+        }
+
+    if properties:
+        notion.pages.update(page_id, properties=properties)
