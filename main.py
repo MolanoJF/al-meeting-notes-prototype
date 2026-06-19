@@ -92,6 +92,11 @@ def process_interaction(interaction_page_id: str) -> dict:
 # Webhook — Notion fires this on page.created / page.properties_updated
 # ---------------------------------------------------------------------------
 
+@app.get("/webhook/notion")
+async def webhook_notion_verify():
+    return {"status": "ok"}
+
+
 @app.post("/webhook/notion")
 async def webhook_notion(request: Request):
     body = await request.json()
