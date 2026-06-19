@@ -1,128 +1,259 @@
 """
-Notion API helpers for Workflow B.
-Reads meeting pages and writes formatted summaries back.
+Notion API helpers for the INTERACTIONS DB pipeline.
+
+Trigger: new (or updated) entry in the INTERACTIONS DB where the Notes field
+         contains a Notion meeting recording URL.
+
+Flow:
+  1. read_interaction_entry(page_id)   — read INTERACTIONS entry, extract metadata
+  2. fetch_meeting_page(page_id)       — fetch the recording page, return blocks
+  3. extract_meeting_summary(blocks)   — parse blocks into sections
+  4. mark_as_ingested(page_id, url)    — set Ingested ✓ and Drive URL on entry
 """
 
 import os
+import re
 
 from notion_client import Client
 
-# "AL Meetings (Prototype)" database/data source — the only source this
-# pipeline is allowed to read from and write back to. The Notion integration
-# is shared workspace-wide for other Molior skills, so the webhook will
-# receive events for unrelated pages; this scope check keeps us from
-# processing or writing into anything outside this database.
-ALLOWED_DATABASE_ID = "bfc65feb-e3f0-4ef5-b899-87add4e51898"
-ALLOWED_DATA_SOURCE_ID = "882bf29f-eae3-4c97-ad5f-d9f4d45fe172"
+INTERACTIONS_DB_ID = "71a88748f95e4bd89e4bf8d6eec1b7c2"
+
+# Matches notion.so and notion.com page URLs; captures the 32-char hex page ID.
+_NOTION_URL_RE = re.compile(
+    r"https://(?:www\.)?notion\.(?:so|com)/(?:[a-zA-Z0-9%-]+-)?([a-f0-9]{32})"
+)
 
 
 def _client() -> Client:
     return Client(auth=os.environ["NOTION_API_KEY"])
 
 
-def read_notion_page(page_id: str) -> dict:
+def _norm(uid: str) -> str:
+    return uid.replace("-", "")
+
+
+# ---------------------------------------------------------------------------
+# Read INTERACTIONS entry
+# ---------------------------------------------------------------------------
+
+def read_interaction_entry(page_id: str) -> dict:
+    """
+    Read a page from the INTERACTIONS DB.
+
+    Returns:
+        title           str  — entry title (Interaction property)
+        date            str  — ISO date string or ""
+        interaction_type str — e.g. "Meeting", "Call"
+        notes           str  — raw text of the Notes field
+        meeting_page_id str | None — 32-char hex ID parsed from a Notion URL in Notes
+        ingested        bool — whether already processed
+    """
     notion = _client()
     page = notion.pages.retrieve(page_id)
 
     parent = page.get("parent", {})
-    parent_id = parent.get("database_id") or parent.get("data_source_id")
-    if parent_id not in (ALLOWED_DATABASE_ID, ALLOWED_DATA_SOURCE_ID):
+    parent_db = _norm(parent.get("database_id", ""))
+    if parent_db != _norm(INTERACTIONS_DB_ID):
         raise ValueError(
-            f"Page {page_id} is outside the AL Meetings database (parent: {parent}) — refusing to process"
+            f"Page {page_id} is not in the INTERACTIONS DB (parent: {parent})"
         )
-
-    blocks = notion.blocks.children.list(page_id)
 
     props = page.get("properties", {})
 
+    # Title
     title = ""
-    if props.get("Name"):
-        title_items = props["Name"].get("title", [])
-        title = title_items[0]["text"]["content"] if title_items else "Untitled"
+    for rt in (props.get("Interaction") or {}).get("title", []):
+        title += rt.get("plain_text", "")
 
+    # Date
     date = ""
-    if props.get("Date") and props["Date"].get("date"):
-        date = props["Date"]["date"].get("start", "")
+    date_prop = props.get("Date", {})
+    if date_prop.get("date"):
+        date = date_prop["date"].get("start", "")
 
-    attendees = []
-    if props.get("Attendees"):
-        attendees = [a["name"] for a in props["Attendees"].get("multi_select", [])]
+    # Type
+    interaction_type = ""
+    type_prop = props.get("Type", {})
+    if type_prop.get("select"):
+        interaction_type = type_prop["select"].get("name", "")
 
-    meeting_type = "internal"
-    if props.get("Meeting type") and props["Meeting type"].get("select"):
-        raw = props["Meeting type"]["select"].get("name", "internal")
-        meeting_type = "client-facing" if "client" in raw.lower() else "internal"
+    # Notes (rich_text)
+    notes = ""
+    for rt in (props.get("Notes") or {}).get("rich_text", []):
+        notes += rt.get("plain_text", "")
 
-    status = ""
-    if props.get("Status") and props["Status"].get("select"):
-        status = props["Status"]["select"].get("name", "")
+    # Ingested flag
+    ingested = (props.get("Ingested") or {}).get("checkbox", False)
+
+    # Parse meeting recording URL out of Notes
+    meeting_page_id = None
+    m = _NOTION_URL_RE.search(notes)
+    if m:
+        meeting_page_id = m.group(1)
 
     return {
         "title": title,
         "date": date,
-        "attendees": attendees,
-        "meeting_type": meeting_type,
-        "status": status,
-        "blocks": blocks,
+        "interaction_type": interaction_type,
+        "notes": notes,
+        "meeting_page_id": meeting_page_id,
+        "ingested": ingested,
     }
 
 
-def extract_transcript(blocks: dict) -> str:
-    texts = []
-    for block in blocks.get("results", []):
-        btype = block.get("type", "")
-        if btype in ("paragraph", "quote", "callout", "bulleted_list_item", "numbered_list_item"):
-            rich = block.get(btype, {}).get("rich_text", [])
-            line = "".join(r.get("plain_text", "") for r in rich)
-            if line.strip():
-                texts.append(line)
-    return "\n".join(texts)
+# ---------------------------------------------------------------------------
+# Fetch meeting recording page
+# ---------------------------------------------------------------------------
+
+def _blocks_recursive(notion: Client, block_id: str, depth: int = 0) -> list:
+    """Walk the block tree up to 4 levels deep (meeting-notes blocks nest deeply)."""
+    if depth > 4:
+        return []
+    blocks = []
+    cursor = None
+    while True:
+        kw = {"block_id": block_id}
+        if cursor:
+            kw["start_cursor"] = cursor
+        resp = notion.blocks.children.list(**kw)
+        for block in resp.get("results", []):
+            blocks.append(block)
+            if block.get("has_children"):
+                blocks.extend(_blocks_recursive(notion, block["id"], depth + 1))
+        if not resp.get("has_more"):
+            break
+        cursor = resp["next_cursor"]
+    return blocks
 
 
-def write_summary_to_notion(page_id: str, formatted: dict):
+def fetch_meeting_page(page_id: str) -> dict:
+    """
+    Fetch a Notion meeting recording page.
+
+    Returns:
+        title       str  — page title
+        date        str  — date from title mention or ""
+        attendees   list[str] — names from meeting-notes attendees metadata (best-effort)
+        blocks      list — all blocks (recursively fetched, including nested meeting-notes)
+    """
     notion = _client()
+    page = notion.pages.retrieve(page_id)
 
-    decisions_text = "\n".join(f"• {d}" for d in formatted.get("key_decisions", []))
-    actions_lines = [
-        f"• {a['who']} — {a['what']} (by {a['by_when']})"
-        for a in formatted.get("action_items", [])
-    ]
-    actions_text = "\n".join(actions_lines)
-    risks = formatted.get("risks_flagged", [])
-    risks_text = "\n".join(f"• {r}" for r in risks) if risks else ""
+    props = page.get("properties", {})
+    title = ""
+    for _key, prop in props.items():
+        if prop.get("type") == "title":
+            for rt in prop.get("title", []):
+                title += rt.get("plain_text", "")
+            break
 
-    children = [
-        {"type": "divider", "divider": {}},
-        {
-            "type": "heading_2",
-            "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": "AL Formatted Summary"}}]
-            },
-        },
-        _text_block("Summary", formatted.get("summary", "")),
-        _text_block("Key Decisions", decisions_text),
-        _text_block("Action Items", actions_text),
-    ]
-
-    if risks_text:
-        children.append(_text_block("Open Questions / Risks", risks_text))
-
-    next_mtg = formatted.get("next_meeting")
-    if next_mtg:
-        children.append(_text_block("Next Meeting", next_mtg))
-
-    notion.blocks.children.append(page_id, children=children)
-    notion.pages.update(page_id, properties={"Status": {"select": {"name": "Processed"}}})
+    blocks = _blocks_recursive(notion, page_id)
+    return {"title": title, "blocks": blocks}
 
 
-def _text_block(heading: str, body: str) -> dict:
+# ---------------------------------------------------------------------------
+# Parse blocks → sections
+# ---------------------------------------------------------------------------
+
+_HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
+_CONTENT_TYPES = {
+    "paragraph", "bulleted_list_item", "numbered_list_item",
+    "quote", "callout",
+}
+_ACTION_KEYWORDS = {"action item", "action", "follow-up", "follow up", "next step"}
+
+
+def _rt_to_str(rich_text: list) -> str:
+    return "".join(r.get("plain_text", "") for r in rich_text).strip()
+
+
+def extract_meeting_summary(blocks: list) -> dict:
+    """
+    Parse a flat list of Notion blocks into structured sections.
+
+    Returns:
+        sections     list[dict]  — [{"heading": str, "lines": [str], "is_actions": bool}]
+        action_items list[dict]  — [{"who": str, "what": str, "by_when": str}]
+        raw_summary  str         — full text of first/largest section (fallback for title doc)
+    """
+    sections: list[dict] = []
+    current_heading: str | None = None
+    current_lines: list[str] = []
+
+    def flush():
+        nonlocal current_heading, current_lines
+        if current_heading and current_lines:
+            is_actions = any(kw in current_heading.lower() for kw in _ACTION_KEYWORDS)
+            sections.append({
+                "heading": current_heading,
+                "lines": list(current_lines),
+                "is_actions": is_actions,
+            })
+        current_heading = None
+        current_lines = []
+
+    for block in blocks:
+        btype = block.get("type", "")
+
+        if btype in _HEADING_TYPES:
+            flush()
+            text = _rt_to_str(block.get(btype, {}).get("rich_text", []))
+            if text:
+                current_heading = text
+
+        elif btype in _CONTENT_TYPES:
+            text = _rt_to_str(block.get(btype, {}).get("rich_text", []))
+            if text and current_heading is not None:
+                current_lines.append(text)
+
+        elif btype == "to_do":
+            text = _rt_to_str(block.get("to_do", {}).get("rich_text", []))
+            if text:
+                if current_heading is None:
+                    current_heading = "Action Items"
+                current_lines.append(text)
+
+        # meeting_notes / synced_block / column_list containers are skipped here;
+        # their children are already in the flat list from _blocks_recursive.
+
+    flush()
+
+    # Build action items from sections flagged as_actions
+    action_items: list[dict] = []
+    for sec in sections:
+        if not sec["is_actions"]:
+            continue
+        for line in sec["lines"]:
+            # Common Notion format: "Person to do something"
+            # Split on " to " (first occurrence) to get who/what
+            parts = re.split(r"\s+to\s+", line, maxsplit=1)
+            if len(parts) == 2:
+                action_items.append({"who": parts[0].strip(), "what": parts[1].strip(), "by_when": "TBD"})
+            else:
+                action_items.append({"who": "", "what": line, "by_when": "TBD"})
+
+    # Fallback summary: join all non-action section lines
+    raw_summary = "\n\n".join(
+        f"{sec['heading']}\n" + "\n".join(sec["lines"])
+        for sec in sections
+        if not sec["is_actions"]
+    )
+
     return {
-        "type": "callout",
-        "callout": {
-            "rich_text": [
-                {"type": "text", "text": {"content": f"{heading}\n{body}"}},
-            ],
-            "icon": {"type": "emoji", "emoji": "📋"},
-            "color": "gray_background",
-        },
+        "sections": sections,
+        "action_items": action_items,
+        "raw_summary": raw_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Write-back
+# ---------------------------------------------------------------------------
+
+def mark_as_ingested(page_id: str, drive_url: str | None = None):
+    """Set Ingested = ✓ (and optionally Drive URL) on an INTERACTIONS entry."""
+    notion = _client()
+    properties: dict = {"Ingested": {"checkbox": True}}
+    if drive_url:
+        properties["Drive URL"] = {"url": drive_url}
+    notion.pages.update(page_id, properties=properties)
