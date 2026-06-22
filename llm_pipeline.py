@@ -114,7 +114,7 @@ def structure_sections(page_text: str) -> list:
     """
     resp = _client.messages.create(
         model=_MODEL,
-        max_tokens=4096,
+        max_tokens=8096,
         system=_SECTIONS_SYSTEM,
         messages=[{"role": "user", "content": page_text}],
     )
