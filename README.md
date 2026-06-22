@@ -1,129 +1,210 @@
 # AL Meeting Notes Automation
 
-**A working prototype for Ackroyd Lowrie × Molior.**
+**A Notion-native pipeline that turns a Notion AI meeting recording into a branded AL Word document — automatically.**
 
-Every AL meeting currently needs someone to write up what was decided, track who owns what action and by when, file a document in the right project folder, and share action items with attendees. This automates that, end to end — no one types up notes again.
+When a new meeting recording page appears in the AL Meetings database, the service wakes up, reads the Notion AI summary, runs it through Claude, builds a formatted DOCX using AL's branded template, uploads it to Google Drive, and writes the Drive link back into Notion. No one touches a template. No one copies text.
 
-This repo contains a real, deployed service. Two different ways to trigger it are demonstrated here — not slideware, not mockups. Both produce the same branded AL Word document automatically.
-
-📊 **Diagrams:** [`diagrams/Workflow A — Granola-Native Pipeline.pdf`](diagrams/Workflow%20A%20%E2%80%94%20Granola-Native%20Pipeline.pdf) · [`diagrams/Workflow B — Notion-Native Pipeline.pdf`](diagrams/Workflow%20B%20%E2%80%94%20Notion-Native%20Pipeline.pdf)
-
-🎬 **Presenting this?** See [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for the full run-of-show.
+Live service: `https://al-meeting-notes.onrender.com`
 
 ---
 
-## What it does
+## How it works
 
-Two different triggers — a Granola recording, or a Notion meeting page — both flow into the same pipeline:
+```
+Notion AI records meeting
+         │
+         ▼
+Notion Automation fires webhook → POST /webhook/notion
+         │
+         ▼
+1.  Read Status — skip if already Processing or Done
+2.  Mark Status = Processing
+3.  Fetch the Notion AI meeting page (title + attendees + AI summary blocks)
+4.  Render blocks to plain text the LLM can read
+5.  Claude extracts metadata: project, meeting type, date, attendees, next meeting
+6.  Claude structures sections: headings → numbered items, action items flagged with owner
+7.  Assemble the full document data object
+8.  Generate DOCX from AL branded template (assets/template.docx)
+9.  Upload DOCX to Google Drive → get webViewLink
+10. Mark Status = Done, write Drive URL to Document property
+```
 
-1. **Claude reads the transcript** and extracts what matters: a summary, the key decisions made, action items (who owns what, by when), risks worth flagging, and the next meeting date.
-2. **A branded Word document is built automatically** — AL logo, AL fonts, AL formatting. No template to fill in by hand.
-3. **The finished document lands in Drive** (Egnyte in production), named and filed automatically. For Workflow B, the same structured summary is also written back into the Notion page itself.
-
-Nobody copies text across documents. Nobody formats anything. Nobody has to remember to do it.
+If anything in steps 3–10 fails: Status is set to `Error` and the error message is written to the `Notes` property on the Notion page.
 
 ---
-
-## The two workflows
-
-| | Workflow A — Granola | Workflow B — Notion |
-|---|---|---|
-| **Trigger** | Render polls Granola's API every 5 min | Notion fires a webhook the instant a meeting is marked ready |
-| **Input** | Granola's auto-recorded transcript | Notion AI Meeting Notes — auto-recorded transcript + first-pass summary |
-| **Claude's job** | Extract structure from a raw transcript, with project context injected from Supabase | Lighter — Notion's already done some of the structuring; Claude formats it to AL standard |
-| **Where the record lives** | Egnyte only | Notion (source of truth) + Egnyte (client-facing docs) |
-| **Best fit if…** | AL stays with its current toolset | AL commits to Notion as the project hub |
-
-Full architecture, every step, in the [diagrams](diagrams/).
-
----
-
-## See it live
-
-| | |
-|---|---|
-| **Service** | `https://al-meeting-notes.onrender.com` |
-| **Workflow A demo** | `GET /demo/granola` — runs the fixture transcript through the full pipeline |
-| **Workflow B demo** | `GET /demo/notion` — runs the seeded Notion page through the full pipeline |
-| **Workflow B live** | Flip `Status` → `Ready` on a page in the "AL Meetings (Prototype)" Notion database — the webhook does the rest, no manual trigger needed |
 
 ## Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Service health check |
-| `POST` | `/format` | Format a transcript (shared, both workflows) |
-| `GET` | `/demo/granola` | Trigger Workflow A with fixture transcript |
-| `POST` | `/webhook/notion` | Workflow B — receives Notion integration webhook (events + verification handshake) |
-| `GET` | `/demo/notion?page_id=...` | Workflow B — manual trigger fallback, defaults to the seeded demo page |
+| `GET` | `/webhook/notion` | Notion webhook verification handshake (returns 200 OK) |
+| `POST` | `/webhook/notion` | Main webhook receiver — processes one meeting page |
+| `GET` | `/manual?page_id=<id>` | Manually trigger the pipeline for a specific page |
+| `GET` | `/manual?page_id=<id>&db_id=<id>` | Manual trigger with explicit database ID for tenant key lookup |
+
+The `/manual` endpoint is the fallback for any page that slips through without a webhook event — it runs the exact same pipeline as the webhook path.
 
 ---
 
-## Local setup
+## File structure
 
-```bash
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env      # fill in your keys
-uvicorn main:app --reload
+```
+main.py                  # FastAPI app — all endpoints + the 10-step pipeline
+llm_pipeline.py          # Claude calls: extract_metadata() and structure_sections()
+notion_utils.py          # Notion API helpers (fetch, render, status updates)
+drive.py                 # Google Drive upload via OAuth user credentials
+scripts/
+  generate_docx.py       # Fill AL branded template with meeting data → .docx
+assets/
+  template.docx          # AL branded Word template (3 tables: header, content, actions)
+  al_logo.jpg            # AL logo (embedded in generated documents)
+render.yaml              # Render deployment config
+requirements.txt
 ```
 
-## Deploy to Render
+---
 
-Connect this repo in the Render dashboard. `render.yaml` handles the config.
-Set all env vars in the Render dashboard (Environment tab) — they are marked `sync: false` intentionally.
+## Environment variables
 
-## Env vars
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Claude API key |
+| `NOTION_TENANTS` | Yes | JSON map of database IDs → tenant credentials (see below) |
+| `GOOGLE_DRIVE_FOLDER_ID` | No | Drive folder to upload docs into — service skips upload if unset |
+| `GOOGLE_OAUTH_CLIENT_ID` | No* | OAuth client ID for Drive |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | No* | OAuth client secret for Drive |
+| `GOOGLE_OAUTH_REFRESH_TOKEN` | No* | Long-lived refresh token for Drive |
 
-See `.env.example` for the full list. Minimum to run `/demo/granola`:
-- `ANTHROPIC_API_KEY`
+*Required only if `GOOGLE_DRIVE_FOLDER_ID` is set.
 
-Minimum to run `/webhook/notion`:
-- `ANTHROPIC_API_KEY`
-- `NOTION_API_KEY`
-- `NOTION_MEETINGS_DB_ID`
+### NOTION_TENANTS format
 
-Google Drive upload is optional — service degrades gracefully if `GOOGLE_DRIVE_FOLDER_ID` is not set.
+Each key is a database ID **with dashes removed**. Each value is the Notion integration secret for that database and an optional display name:
 
-Google Drive auth uses OAuth user credentials (same grant as the `gws` CLI) — `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN` — not a service account.
+```json
+{
+  "387b251472b3801d965cf4ca3be355a0": {
+    "api_key": "secret_xxxxxxxxxxxx",
+    "name": "Ackroyd Lowrie"
+  }
+}
+```
 
-## Notion setup (Workflow B)
+Multiple tenants (multiple Notion workspaces or databases) can be added to the same JSON object. When a webhook fires, the service reads the page's parent database ID and looks it up in this map to get the right API key.
 
-The "AL Meetings (Prototype)" database lives under the Ackroyd Lowrie client page in Notion.
+---
 
-**Note:** Notion's no-code "Automations" builder (Trigger → Send webhook) requires a Business plan. We don't have that, so we use **Integration Webhooks** instead — a separate, developer-facing feature configured in the integration's own settings, available regardless of workspace plan.
+## Deploying to Render
 
-1. **Create a Notion integration token** at notion.so/my-integrations → "New integration" → internal → copy the secret → set as `NOTION_API_KEY` in Render. Then open the AL Meetings database in Notion → "..." menu → Connections → add the integration.
-2. **Subscribe to webhooks**: in the integration's settings → Webhooks tab → add subscription → URL: `https://<your-render-url>/webhook/notion`. Notion sends a one-time `{"verification_token": "..."}` POST — `/webhook/notion` logs it (check Render logs), copy the token back into the Webhooks tab's Verify dialog to activate.
-3. Once verified, subscribe to page/data source update events for the AL Meetings database.
+Connect this repo in the Render dashboard. `render.yaml` handles the configuration.
 
-**Fallback if webhook verification isn't done yet or flakes during the demo:** hit `GET /demo/notion` directly — it processes the seeded page exactly the same way, just triggered manually instead of by a live Notion event. Same output, same code path, zero risk during the presentation.
+Set all environment variables in the Render dashboard under **Environment** — they are intentionally marked `sync: false` (not stored in the repo). The service starts with:
+
+```
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+---
+
+## Onboarding a new user / tenant
+
+Follow these steps each time a new Notion workspace or database needs to be connected.
+
+### Step 1 — Notion database setup
+
+The database that holds meeting recording pages needs four properties:
+
+| Property | Type | Purpose |
+|---|---|---|
+| `Name` (or `Title`) | Title | Page name — auto-set by Notion AI |
+| `Status` | Select | Pipeline tracks state here: `Processing`, `Done`, `Error` |
+| `Document` | URL | Drive link written back when processing completes |
+| `Notes` | Rich text | Error messages written here if the pipeline fails |
+
+Add the select options `Processing`, `Done`, `Error` to the `Status` property.
+
+### Step 2 — Create a Notion integration
+
+1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) → **New integration**.
+2. Scope: Internal. No user information needed.
+3. Copy the **Internal Integration Secret** — this is the `api_key` for `NOTION_TENANTS`.
+4. Open the AL Meetings database in Notion → click `...` → **Connections** → add the new integration.
+
+### Step 3 — Get the database ID
+
+Open the database in Notion. The URL looks like:
+
+```
+https://www.notion.so/<workspace>/<database_id>?v=<view_id>
+```
+
+Copy the `<database_id>` segment (32 hex characters with dashes). Remove the dashes — that is the key used in `NOTION_TENANTS`.
+
+### Step 4 — Add to NOTION_TENANTS
+
+In Render → Environment, update `NOTION_TENANTS` to include the new tenant:
+
+```json
+{
+  "existing_db_id_no_dashes": { "api_key": "secret_existing", "name": "Existing Client" },
+  "new_db_id_no_dashes":      { "api_key": "secret_new",      "name": "New Client" }
+}
+```
+
+Render will redeploy automatically.
+
+### Step 5 — Set up Notion Automation
+
+Notion Automations (no-code, available on free plans via the Automations tab in the database view) fire the webhook when a new page is created by Notion AI.
+
+1. Open the database → **Automations** tab → **+ New automation**.
+2. Trigger: **Page added to database**.
+3. Action: **Send a webhook** → URL: `https://al-meeting-notes.onrender.com/webhook/notion`.
+4. Save and enable the automation.
+
+> **Note:** This uses Notion's built-in no-code Automations, not Integration Webhooks. No verification token is required — the POST goes directly to the service.
+
+### Step 6 — Test it
+
+Either create a real meeting in Notion (let Notion AI process it, wait ~2 min, then check Status) or trigger manually:
+
+```
+GET https://al-meeting-notes.onrender.com/manual?page_id=<page_id>&db_id=<db_id>
+```
+
+`page_id` is the 32-char hex ID of a specific meeting page (from its URL). `db_id` is the database ID with or without dashes. If `db_id` is omitted, the service falls back to the first matching API key in `NOTION_TENANTS`.
+
+---
+
+## Google Drive setup (optional)
+
+Drive upload is optional — the service degrades gracefully if the Drive credentials are not set (the DOCX is generated but not saved anywhere persistent, and `drive_url` in the response will be `null`).
+
+To enable:
+
+1. Create an OAuth 2.0 Client ID in Google Cloud Console (Desktop app type).
+2. Run the OAuth consent flow once locally to obtain a refresh token — use the same Google account that owns the target Drive folder. The `gws` CLI or any standard OAuth desktop flow works.
+3. Set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN` in Render.
+4. Set `GOOGLE_DRIVE_FOLDER_ID` to the folder ID from the Drive URL (`https://drive.google.com/drive/folders/<folder_id>`).
+
+---
 
 ## Production swaps
 
 | Prototype | Production |
 |---|---|
-| Fixture transcript (`fixtures/`) | Granola Business API |
-| Manual Notion page + transcript | Notion AI Meeting Notes (Business plan) |
-| Google Drive (`drive.py`) | Egnyte API (swap module, same interface) |
-| `print()` email stub | SendGrid / Gmail SMTP |
+| Google Drive (`drive.py`) | Egnyte API — swap the module, same `upload_to_drive(local_path, filename)` interface |
+| Claude Haiku | Can upgrade to a more capable model in `llm_pipeline.py → _MODEL` |
 
-## Structure
+---
 
-```
-main.py              # FastAPI app — all endpoints
-skill.py             # Claude formatting skill (shared)
-word_gen.py          # python-docx AL branded document
-drive.py             # Google Drive upload
-notion_utils.py      # Notion API helpers (Workflow B)
-fixtures/
-  sample_transcript.json   # AL-flavored mock transcript
-diagrams/
-  Workflow A — Granola-Native Pipeline.pdf
-  Workflow B — Notion-Native Pipeline.pdf
-assets/
-  al_logo.jpg         # extracted from AL's reference document, used in generated docs
-render.yaml          # Render deployment config
-DEMO_SCRIPT.md        # presentation run-of-show
-```
+## Troubleshooting
+
+**Status stuck on Processing** — the pipeline crashed before it could write Error. Check Render logs for the page ID. Use `/manual?page_id=...` to retry once the underlying issue is fixed — the pipeline checks status at the start and will re-run since the page never reached Done.
+
+**Status = Error, Notes says "Meeting page has no summary blocks"** — Notion AI was still generating when the webhook fired. Wait a minute and hit `/manual?page_id=...` to retry.
+
+**Webhook not firing** — confirm the Automation is enabled and the integration has access to the database. Check Render logs for incoming POST requests to `/webhook/notion`.
+
+**Drive upload failing** — the OAuth refresh token may have expired. Re-run the OAuth consent flow and update `GOOGLE_OAUTH_REFRESH_TOKEN` in Render. Drive errors do not fail the pipeline — Status is still set to Done, just without a Document URL.
