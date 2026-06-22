@@ -6,6 +6,7 @@ structure_sections() → parse summary content → AL numbered sections format
 """
 
 import json
+import re
 from datetime import date
 
 import anthropic
@@ -84,6 +85,22 @@ Rules:
 """
 
 
+def _extract_json(raw: str) -> str:
+    """Strip markdown fences and return the innermost JSON text."""
+    text = raw.strip()
+    # Handle ```json ... ``` or ``` ... ```
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fence:
+        return fence.group(1).strip()
+    # Fallback: extract outermost { } or [ ]
+    for opener, closer in [('{', '}'), ('[', ']')]:
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end > start:
+            return text[start:end + 1]
+    return text
+
+
 def extract_metadata(page_text: str) -> dict:
     """
     Step 2: infer all meeting metadata from the page text.
@@ -99,12 +116,7 @@ def extract_metadata(page_text: str) -> dict:
         messages=[{"role": "user", "content": user_msg}],
     )
     raw = resp.content[0].text.strip()
-    # Strip markdown fences if the model added them despite instructions
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
+    return json.loads(_extract_json(raw))
 
 
 _MAX_SECTION_INPUT = 6_000  # typical meeting ~3-5k chars; cap protects output token limit
@@ -125,9 +137,5 @@ def structure_sections(page_text: str) -> list:
         messages=[{"role": "user", "content": page_text}],
     )
     raw = resp.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    result = json.loads(raw)
+    result = json.loads(_extract_json(raw))
     return result.get("sections", result) if isinstance(result, dict) else result
