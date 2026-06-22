@@ -107,11 +107,17 @@ def extract_metadata(page_text: str) -> dict:
     return json.loads(raw)
 
 
+_MAX_SECTION_INPUT = 10_000  # typical meeting ~3-5k chars; cap protects output token limit
+
+
 def structure_sections(page_text: str) -> list:
     """
     Step 3: parse summary content into AL numbered sections.
     Returns the 'sections' list matching the SKILL.md schema.
     """
+    if len(page_text) > _MAX_SECTION_INPUT:
+        page_text = page_text[:_MAX_SECTION_INPUT]
+
     resp = _client.messages.create(
         model=_MODEL,
         max_tokens=8096,
