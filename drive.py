@@ -1,30 +1,32 @@
 """
-Uploads a Word doc to Google Drive using a service account.
+Uploads a Word doc to Google Drive using OAuth user credentials.
 
 Requires:
-  GOOGLE_SERVICE_ACCOUNT_JSON  — full service account JSON key as a string
+  GOOGLE_OAUTH_CLIENT_ID       — OAuth client ID
+  GOOGLE_OAUTH_CLIENT_SECRET   — OAuth client secret
+  GOOGLE_OAUTH_REFRESH_TOKEN   — long-lived refresh token
   GOOGLE_DRIVE_FOLDER_ID       — Drive folder ID to upload into
-
-AL shares the target Drive folder with the service account email (Editor).
-No OAuth flow or user interaction required.
 """
 
-import json
 import os
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 _SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
 def _get_drive_service():
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not sa_json:
-        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
-    info = json.loads(sa_json)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+    creds = Credentials(
+        token=None,
+        refresh_token=os.environ["GOOGLE_OAUTH_REFRESH_TOKEN"],
+        token_uri=_TOKEN_URI,
+        client_id=os.environ["GOOGLE_OAUTH_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
+        scopes=_SCOPES,
+    )
     return build("drive", "v3", credentials=creds)
 
 
@@ -32,13 +34,7 @@ def upload_to_drive(local_path: str, filename: str, folder_id: str | None = None
     """
     Upload a DOCX to Google Drive.
 
-    Args:
-        local_path: absolute path to the local file
-        filename:   name to use in Drive (include .docx extension)
-        folder_id:  Drive folder ID; falls back to GOOGLE_DRIVE_FOLDER_ID env var
-
-    Returns:
-        webViewLink URL, or None if upload is skipped/failed
+    Returns webViewLink URL, or None if upload is skipped/failed.
     """
     folder_id = folder_id or os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
     if not folder_id:
