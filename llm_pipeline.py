@@ -107,7 +107,7 @@ def extract_metadata(page_text: str) -> dict:
     return json.loads(raw)
 
 
-_MAX_SECTION_INPUT = 10_000  # typical meeting ~3-5k chars; cap protects output token limit
+_MAX_SECTION_INPUT = 6_000  # typical meeting ~3-5k chars; cap protects output token limit
 
 
 def structure_sections(page_text: str) -> list:
