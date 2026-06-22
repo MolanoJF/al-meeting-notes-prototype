@@ -1,20 +1,31 @@
 import json
 import os
+import re
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from drive import upload_to_drive
+from llm_pipeline import extract_metadata, structure_sections
 from notion_utils import (
-    extract_meeting_summary,
+    extract_page_text,
     fetch_meeting_page,
-    mark_as_ingested,
-    read_interaction_entry,
-    update_interaction_fields,
+    mark_done,
+    mark_error,
+    mark_processing,
+    read_meeting_status,
 )
-from skill import enrich_interaction_fields
-from word_gen import generate_word_doc
+from scripts.generate_docx import generate_docx
+
+# {"<db_id_no_dashes>": {"api_key": "secret_...", "name": "Jon"}, ...}
+_TENANTS: dict = json.loads(os.environ.get("NOTION_TENANTS", "{}"))
+
+
+def _normalize_id(id_str: str) -> str:
+    return id_str.replace("-", "")
 
 
 @asynccontextmanager
@@ -32,79 +43,76 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline — triggered by webhook or manual demo
+# Core pipeline
 # ---------------------------------------------------------------------------
 
-def process_interaction(interaction_page_id: str) -> dict:
+def process_meeting(page_id: str, api_key: str | None = None) -> dict:
     """
-    Full pipeline for one INTERACTIONS DB entry:
+    Full pipeline for one meeting page:
 
-    1. Read the entry — skip if already ingested.
-    2. Read the entry page's own blocks first (meeting recording moved into DB).
-       Fall back to fetching a separate page via URL in the Notes field.
-    3. Parse Notion's AI summary into sections.
-    4. Generate AL-branded Word doc.
-    5. Upload to Google Drive.
-    6. Mark the INTERACTIONS entry as Ingested + store Drive URL.
+    1. Check status — skip if already Done or Processing.
+    2. Mark as Processing.
+    3. Fetch the Notion AI meeting recording page.
+    4. Render blocks to LLM-readable text.
+    5. Extract metadata (LLM).
+    6. Structure sections (LLM).
+    7. Assemble final JSON.
+    8. Generate DOCX from template.
+    9. Upload to Google Drive.
+    10. Mark as Done with Drive URL.
     """
-    entry = read_interaction_entry(interaction_page_id)
+    status = read_meeting_status(page_id, api_key=api_key)
+    if status in ("Done", "Processing"):
+        return {"status": "skipped", "reason": f"page is already {status}"}
 
-    if entry["ingested"]:
-        return {"status": "skipped", "reason": "already ingested"}
+    mark_processing(page_id, api_key=api_key)
 
-    # Primary: the INTERACTIONS entry IS the meeting recording page
-    meeting = fetch_meeting_page(interaction_page_id)
+    try:
+        page_data = fetch_meeting_page(page_id, api_key=api_key)
 
-    # Fallback: a separate meeting recording URL was pasted into Notes
-    if not meeting["blocks"] and entry["meeting_page_id"]:
-        meeting = fetch_meeting_page(entry["meeting_page_id"])
+        if not page_data["blocks"]:
+            raise ValueError("Meeting page has no summary blocks — Notion AI may still be processing.")
 
-    summary_data = extract_meeting_summary(meeting["blocks"])
+        page_text = extract_page_text(page_data)
 
-    if not summary_data["sections"] and not summary_data["action_items"]:
+        metadata = extract_metadata(page_text)
+        sections = structure_sections(page_text)
+
+        doc_data = {**metadata, "sections": sections}
+
+        slug = re.sub(r"[^\w]", "", (metadata.get("project") or "Meeting").replace(" ", ""))[:30]
+        date_slug = (metadata.get("date") or "").replace(" ", "")
+        filename = f"MeetingNotes_{slug}_{date_slug}.docx"
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        generate_docx(doc_data, Path(tmp_path))
+        drive_url = upload_to_drive(tmp_path, filename)
+
+        mark_done(page_id, drive_url, api_key=api_key)
+
         return {
-            "status": "skipped",
-            "reason": "meeting page has no parseable summary yet — Notion may still be processing",
+            "status": "done",
+            "meeting": metadata.get("meeting_type", ""),
+            "project": metadata.get("project", ""),
+            "sections": len(sections),
+            "filename": filename,
+            "drive_url": drive_url,
         }
 
-    # Use the meeting recording page title if the INTERACTIONS entry title is blank
-    title = entry["title"] or meeting["title"] or "Meeting Notes"
-
-    meeting_meta = {
-        "title": title,
-        "date": entry["date"],
-        "attendees": [],  # INTERACTIONS Person is a relation; names resolved separately
-    }
-
-    doc_path  = generate_word_doc(summary_data, meeting_meta)
-    drive_url = upload_to_drive(doc_path, title, entry["date"])
-
-    # Enrich INTERACTIONS entry fields from meeting content
-    crm_fields: dict = {}
-    try:
-        crm_fields = enrich_interaction_fields(
-            meeting_title=meeting["title"] or title,
-            raw_summary=summary_data["raw_summary"],
-        )
-        update_interaction_fields(interaction_page_id, crm_fields)
-        print(f"[enrich] updated fields: {crm_fields}")
     except Exception as e:
-        print(f"[enrich] non-fatal error — fields not updated: {e}")
-
-    mark_as_ingested(interaction_page_id, drive_url)
-
-    return {
-        "status": "ingested",
-        "meeting": title,
-        "sections": len(summary_data["sections"]),
-        "action_items": len(summary_data["action_items"]),
-        "drive_url": drive_url,
-        "crm_fields": crm_fields,
-    }
+        error_msg = str(e)
+        print(f"[pipeline] Error processing {page_id}: {error_msg}")
+        try:
+            mark_error(page_id, error_msg, api_key=api_key)
+        except Exception:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
-# Webhook — Notion fires this on page.created / page.properties_updated
+# Webhook — Notion Automation fires this on page created
 # ---------------------------------------------------------------------------
 
 @app.get("/webhook/notion")
@@ -117,104 +125,57 @@ async def webhook_notion(request: Request):
     body = await request.json()
     print(f"[webhook/notion] payload: {body}")
 
-    # One-time verification handshake
-    if "verification_token" in body:
-        print(f"[webhook/notion] VERIFICATION TOKEN: {body['verification_token']}")
-        return JSONResponse({"status": "verification_token_logged"})
-
-    entity     = body.get("entity") or {}
-    page_id    = entity.get("id") if entity.get("type") == "page" else None
-    event_type = body.get("type", "")
+    data = body.get("data", {})
+    page_id = data.get("id")
+    raw_db_id = (data.get("parent") or {}).get("database_id", "")
+    db_id = _normalize_id(raw_db_id)
 
     if not page_id:
-        return JSONResponse({"status": "skipped", "reason": "no page entity in payload"})
+        return JSONResponse({"status": "skipped", "reason": "no page id in payload"})
 
-    # page.parent_changed fires when a page is moved into the DB
-    if event_type not in (
-        "page.created",
-        "page.parent_changed",
-        "page.properties_updated",
-        "page.content_updated",
-    ):
-        return JSONResponse({"status": "skipped", "reason": f"event type {event_type} not relevant"})
+    tenant = _TENANTS.get(db_id)
+    if not tenant:
+        print(f"[webhook/notion] unknown db_id: {db_id!r} — check NOTION_TENANTS")
+        return JSONResponse(
+            {"status": "skipped", "reason": f"unknown database {db_id}"},
+            status_code=400,
+        )
+
+    api_key = tenant.get("api_key") or os.environ.get("NOTION_API_KEY")
 
     try:
-        return JSONResponse(process_interaction(page_id))
+        return JSONResponse(process_meeting(page_id, api_key=api_key))
+    except ValueError as e:
+        # Notion AI still generating — return 503 so Notion Automations retries
+        print(f"[webhook/notion] retryable on {page_id}: {e}")
+        return JSONResponse({"status": "retry", "reason": str(e)}, status_code=503)
     except Exception as e:
-        print(f"[webhook/notion] Skipping {page_id}: {e}")
-        return JSONResponse({"status": "skipped", "page_id": page_id, "reason": str(e)})
+        print(f"[webhook/notion] error on {page_id}: {e}")
+        return JSONResponse(
+            {"status": "error", "page_id": page_id, "reason": str(e)},
+            status_code=500,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Manual demo trigger
+# Manual trigger — for testing or missed webhook events
 # ---------------------------------------------------------------------------
 
-@app.get("/demo/notion")
-def demo_notion(page_id: str):
+@app.get("/manual")
+def manual(page_id: str, db_id: str | None = None):
     """
-    Manually trigger the pipeline for a specific INTERACTIONS DB entry.
+    Manually trigger the pipeline for a meeting page.
 
-    Pass the page ID of the INTERACTIONS entry (not the meeting recording page).
-    Useful during development or if the webhook missed an event.
+    page_id: the Notion page ID of the meeting recording.
+    db_id:   optional — the database ID (with or without dashes) used to look up
+             the tenant API key. If omitted, falls back to NOTION_API_KEY env var.
     """
+    api_key = None
+    if db_id:
+        tenant = _TENANTS.get(_normalize_id(db_id))
+        if tenant:
+            api_key = tenant.get("api_key")
     try:
-        return process_interaction(page_id)
+        return process_meeting(page_id, api_key=api_key)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Granola fixture demo (kept for reference — does not use INTERACTIONS DB)
-# ---------------------------------------------------------------------------
-
-@app.get("/demo/granola")
-def demo_granola():
-    """
-    Runs the old Granola fixture through the formatter.
-    Uses skill.py (Claude) — kept for internal reference only.
-    """
-    from skill import format_meeting_notes
-
-    fixture_path = os.path.join(os.path.dirname(__file__), "fixtures", "sample_transcript.json")
-    with open(fixture_path) as f:
-        fixture = json.load(f)
-
-    formatted = format_meeting_notes(
-        transcript=fixture["transcript"],
-        attendees=fixture["attendees"],
-        project=fixture.get("project", "AL — Fee Proposal Module 1"),
-        date=fixture["date"],
-        meeting_type=fixture.get("meeting_type", "client-facing"),
-    )
-
-    # Convert old Claude format → sections format for word_gen
-    sections = []
-    if formatted.get("summary"):
-        sections.append({"heading": "Summary", "lines": [formatted["summary"]], "is_actions": False})
-    if formatted.get("key_decisions"):
-        sections.append({"heading": "Key Decisions", "lines": formatted["key_decisions"], "is_actions": False})
-    if formatted.get("risks_flagged"):
-        sections.append({"heading": "Open Questions / Risks", "lines": formatted["risks_flagged"], "is_actions": False})
-
-    action_items = [
-        {"who": a.get("who", ""), "what": a.get("what", ""), "by_when": a.get("by_when", "TBD")}
-        for a in formatted.get("action_items", [])
-    ]
-    if action_items:
-        sections.append({"heading": "Action Items", "lines": [], "is_actions": True})
-
-    summary_data = {"sections": sections, "action_items": action_items}
-    meeting_meta = {
-        "title": fixture.get("title", fixture.get("project", "Meeting Notes")),
-        "date": fixture["date"],
-        "attendees": fixture.get("attendees", []),
-    }
-
-    doc_path  = generate_word_doc(summary_data, meeting_meta)
-    drive_url = upload_to_drive(doc_path, fixture.get("title", "Meeting"), fixture["date"])
-
-    return {
-        "workflow": "Granola (fixture)",
-        "meeting": meeting_meta["title"],
-        "drive_url": drive_url,
-    }

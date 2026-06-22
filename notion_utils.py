@@ -1,14 +1,13 @@
 """
-Notion API helpers for the INTERACTIONS DB pipeline.
-
-Trigger: new (or updated) entry in the INTERACTIONS DB where the Notes field
-         contains a Notion meeting recording URL.
+Notion API helpers for the Meeting Notes Automation pipeline.
 
 Flow:
-  1. read_interaction_entry(page_id)   — read INTERACTIONS entry, extract metadata
-  2. fetch_meeting_page(page_id)       — fetch the recording page, return blocks
-  3. extract_meeting_summary(blocks)   — parse blocks into sections
-  4. mark_as_ingested(page_id, url)    — set Ingested ✓ and Drive URL on entry
+  1. read_meeting_status(page_id)   — check if page is already Processing/Done
+  2. mark_processing(page_id)       — set Status = Processing
+  3. fetch_meeting_page(page_id)    — fetch the meeting recording page, return blocks
+  4. extract_page_text(page_data)   — render blocks as LLM-readable text
+  5. mark_done(page_id, drive_url)  — set Status = Done, write Drive URL
+  6. mark_error(page_id, msg)       — set Status = Error, write error message
 """
 
 import os
@@ -16,89 +15,53 @@ import re
 
 from notion_client import Client
 
-INTERACTIONS_DB_ID = "71a88748f95e4bd89e4bf8d6eec1b7c2"
-
-# Matches notion.so and notion.com page URLs; captures the 32-char hex page ID.
-_NOTION_URL_RE = re.compile(
-    r"https://(?:www\.)?notion\.(?:so|com)/(?:[a-zA-Z0-9%-]+-)?([a-f0-9]{32})"
-)
-
-
-def _client() -> Client:
-    return Client(auth=os.environ["NOTION_API_KEY"])
+_CONTENT_TYPES = {
+    "paragraph", "bulleted_list_item", "numbered_list_item",
+    "quote", "callout",
+}
+_HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
 
 
-def _norm(uid: str) -> str:
-    return uid.replace("-", "")
+def _client(api_key: str | None = None) -> Client:
+    return Client(auth=api_key or os.environ["NOTION_API_KEY"])
+
+
+def _rt_to_str(rich_text: list) -> str:
+    return "".join(r.get("plain_text", "") for r in rich_text).strip()
 
 
 # ---------------------------------------------------------------------------
-# Read INTERACTIONS entry
+# Meeting page status operations
 # ---------------------------------------------------------------------------
 
-def read_interaction_entry(page_id: str) -> dict:
-    """
-    Read a page from the INTERACTIONS DB.
-
-    Returns:
-        title           str  — entry title (Interaction property)
-        date            str  — ISO date string or ""
-        interaction_type str — e.g. "Meeting", "Call"
-        notes           str  — raw text of the Notes field
-        meeting_page_id str | None — 32-char hex ID parsed from a Notion URL in Notes
-        ingested        bool — whether already processed
-    """
-    notion = _client()
-    page = notion.pages.retrieve(page_id)
-
-    parent = page.get("parent", {})
-    parent_db = _norm(parent.get("database_id", ""))
-    if parent_db != _norm(INTERACTIONS_DB_ID):
-        raise ValueError(
-            f"Page {page_id} is not in the INTERACTIONS DB (parent: {parent})"
-        )
-
+def read_meeting_status(page_id: str, api_key: str | None = None) -> str:
+    """Read the Status select value from a meeting page. Returns '' if not set."""
+    page = _client(api_key).pages.retrieve(page_id)
     props = page.get("properties", {})
+    status_prop = props.get("Status", {})
+    if status_prop.get("select"):
+        return status_prop["select"].get("name", "")
+    return ""
 
-    # Title
-    title = ""
-    for rt in (props.get("Interaction") or {}).get("title", []):
-        title += rt.get("plain_text", "")
 
-    # Date
-    date = ""
-    date_prop = props.get("Date", {})
-    if date_prop.get("date"):
-        date = date_prop["date"].get("start", "")
+def mark_processing(page_id: str, api_key: str | None = None):
+    _client(api_key).pages.update(page_id, properties={
+        "Status": {"select": {"name": "Processing"}},
+    })
 
-    # Type
-    interaction_type = ""
-    type_prop = props.get("Type", {})
-    if type_prop.get("select"):
-        interaction_type = type_prop["select"].get("name", "")
 
-    # Notes (rich_text)
-    notes = ""
-    for rt in (props.get("Notes") or {}).get("rich_text", []):
-        notes += rt.get("plain_text", "")
+def mark_done(page_id: str, drive_url: str | None, api_key: str | None = None):
+    props: dict = {"Status": {"select": {"name": "Done"}}}
+    if drive_url:
+        props["Document"] = {"url": drive_url}
+    _client(api_key).pages.update(page_id, properties=props)
 
-    # Ingested flag
-    ingested = (props.get("Ingested") or {}).get("checkbox", False)
 
-    # Parse meeting recording URL out of Notes
-    meeting_page_id = None
-    m = _NOTION_URL_RE.search(notes)
-    if m:
-        meeting_page_id = m.group(1)
-
-    return {
-        "title": title,
-        "date": date,
-        "interaction_type": interaction_type,
-        "notes": notes,
-        "meeting_page_id": meeting_page_id,
-        "ingested": ingested,
-    }
+def mark_error(page_id: str, error_msg: str, api_key: str | None = None):
+    _client(api_key).pages.update(page_id, properties={
+        "Status": {"select": {"name": "Error"}},
+        "Notes": {"rich_text": [{"type": "text", "text": {"content": error_msg[:2000]}}]},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +69,7 @@ def read_interaction_entry(page_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _blocks_flat(notion: Client, block_id: str, depth: int = 0) -> list:
-    """Recursively fetch all child blocks (plain — no meeting_notes special-casing)."""
+    """Recursively fetch all child blocks."""
     if depth > 4:
         return []
     blocks = []
@@ -127,33 +90,41 @@ def _blocks_flat(notion: Client, block_id: str, depth: int = 0) -> list:
 
 
 def _summary_blocks_from_meeting_notes(notion: Client, meeting_notes_block_id: str) -> list:
-    """
-    Return only the AI summary child blocks of a meeting_notes block.
-
-    Notion meeting recording pages have three children under the meeting_notes
-    block: (1) AI summary, (2) notes, (3) transcript. We only want (1).
-    """
+    """Return only the AI summary child blocks of a meeting_notes block."""
     resp = notion.blocks.children.list(block_id=meeting_notes_block_id)
     children = resp.get("results", [])
     if not children:
         return []
-    summary_block = children[0]          # first child = AI summary section
+    summary_block = children[0]
     blocks = [summary_block]
     if summary_block.get("has_children"):
         blocks.extend(_blocks_flat(notion, summary_block["id"]))
     return blocks
 
 
-def fetch_meeting_page(page_id: str) -> dict:
+def _extract_attendees(meeting_notes_block: dict) -> list[str]:
+    mn = meeting_notes_block.get("meeting_notes", {})
+    attendees = mn.get("meeting_attendees", [])
+    names = []
+    for a in attendees:
+        user = a.get("user", {})
+        name = user.get("name", "")
+        if name:
+            names.append(name)
+    return names
+
+
+def fetch_meeting_page(page_id: str, api_key: str | None = None) -> dict:
     """
     Fetch a Notion meeting recording page.
     Only the AI-generated summary section is extracted — not notes or transcript.
 
     Returns:
-        title  str  — page title
-        blocks list — summary blocks only
+        title     str       — page title
+        blocks    list      — summary blocks only
+        attendees list[str] — names from the meeting_notes attendee list (may be empty)
     """
-    notion = _client()
+    notion = _client(api_key)
     page = notion.pages.retrieve(page_id)
 
     props = page.get("properties", {})
@@ -164,166 +135,58 @@ def fetch_meeting_page(page_id: str) -> dict:
                 title += rt.get("plain_text", "")
             break
 
-    # Walk top-level blocks; for meeting_notes blocks, only descend into summary
     top = notion.blocks.children.list(block_id=page_id)
     all_blocks: list = []
+    attendees: list[str] = []
+
     for block in top.get("results", []):
         btype = block.get("type", "")
         all_blocks.append(block)
-        if btype == "meeting_notes" and block.get("has_children"):
-            all_blocks.extend(_summary_blocks_from_meeting_notes(notion, block["id"]))
+        if btype == "meeting_notes":
+            attendees = _extract_attendees(block)
+            if block.get("has_children"):
+                all_blocks.extend(_summary_blocks_from_meeting_notes(notion, block["id"]))
         elif block.get("has_children"):
             all_blocks.extend(_blocks_flat(notion, block["id"]))
 
-    return {"title": title, "blocks": all_blocks}
+    return {"title": title, "blocks": all_blocks, "attendees": attendees}
 
 
 # ---------------------------------------------------------------------------
-# Parse blocks → sections
+# Render blocks to LLM-readable text
 # ---------------------------------------------------------------------------
 
-_HEADING_TYPES = {"heading_1", "heading_2", "heading_3"}
-_CONTENT_TYPES = {
-    "paragraph", "bulleted_list_item", "numbered_list_item",
-    "quote", "callout",
-}
-_ACTION_KEYWORDS = {"action item", "action", "follow-up", "follow up", "next step"}
+def extract_page_text(page_data: dict) -> str:
+    lines = []
 
+    title = page_data.get("title", "")
+    if title:
+        lines.append(f"Page title: {title}")
 
-def _rt_to_str(rich_text: list) -> str:
-    return "".join(r.get("plain_text", "") for r in rich_text).strip()
+    attendees = page_data.get("attendees", [])
+    if attendees:
+        lines.append(f"Attendees: {', '.join(attendees)}")
 
+    lines.append("")
+    lines.append("SUMMARY:")
 
-def extract_meeting_summary(blocks: list) -> dict:
-    """
-    Parse a flat list of Notion blocks into structured sections.
-
-    Returns:
-        sections     list[dict]  — [{"heading": str, "lines": [str], "is_actions": bool}]
-        action_items list[dict]  — [{"who": str, "what": str, "by_when": str}]
-        raw_summary  str         — full text of first/largest section (fallback for title doc)
-    """
-    sections: list[dict] = []
-    current_heading: str | None = None
-    current_lines: list[str] = []
-    past_action_items = False
-
-    def flush():
-        nonlocal current_heading, current_lines, past_action_items
-        if current_heading and current_lines:
-            is_actions = any(kw in current_heading.lower() for kw in _ACTION_KEYWORDS)
-            if is_actions:
-                past_action_items = True
-            sections.append({
-                "heading": current_heading,
-                "lines": list(current_lines),
-                "is_actions": is_actions,
-            })
-        current_heading = None
-        current_lines = []
-
-    for block in blocks:
+    for block in page_data.get("blocks", []):
         btype = block.get("type", "")
 
         if btype in _HEADING_TYPES:
-            flush()
-            # First heading after action items = start of notes/transcript — stop.
-            if past_action_items:
-                break
             text = _rt_to_str(block.get(btype, {}).get("rich_text", []))
             if text:
-                current_heading = text
+                lines.append(f"### {text}")
 
         elif btype in _CONTENT_TYPES:
-            # Skip paragraphs/bullets under an action items heading — transcript
-            # bleeds in as paragraph blocks directly after the to_do items.
-            if current_heading is not None and any(
-                kw in current_heading.lower() for kw in _ACTION_KEYWORDS
-            ):
-                continue
             text = _rt_to_str(block.get(btype, {}).get("rich_text", []))
-            if text and current_heading is not None:
-                current_lines.append(text)
+            if text:
+                prefix = "- " if btype in ("bulleted_list_item", "numbered_list_item") else ""
+                lines.append(f"{prefix}{text}")
 
         elif btype == "to_do":
-            # Once we're past action items, stop — no more to_do blocks expected.
-            if past_action_items:
-                break
             text = _rt_to_str(block.get("to_do", {}).get("rich_text", []))
             if text:
-                if current_heading is None:
-                    current_heading = "Action Items"
-                current_lines.append(text)
+                lines.append(f"- [ ] {text}")
 
-    flush()
-
-    # Build action items from sections flagged as_actions
-    action_items: list[dict] = []
-    for sec in sections:
-        if not sec["is_actions"]:
-            continue
-        for line in sec["lines"]:
-            # Common Notion format: "Person to do something"
-            # Split on " to " (first occurrence) to get who/what
-            parts = re.split(r"\s+to\s+", line, maxsplit=1)
-            if len(parts) == 2:
-                action_items.append({"who": parts[0].strip(), "what": parts[1].strip(), "by_when": "TBD"})
-            else:
-                action_items.append({"who": "", "what": line, "by_when": "TBD"})
-
-    # Fallback summary: join all non-action section lines
-    raw_summary = "\n\n".join(
-        f"{sec['heading']}\n" + "\n".join(sec["lines"])
-        for sec in sections
-        if not sec["is_actions"]
-    )
-
-    return {
-        "sections": sections,
-        "action_items": action_items,
-        "raw_summary": raw_summary,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Write-back
-# ---------------------------------------------------------------------------
-
-def mark_as_ingested(page_id: str, drive_url: str | None = None):
-    """Set Ingested = ✓ (and optionally Drive URL) on an INTERACTIONS entry."""
-    notion = _client()
-    properties: dict = {"Ingested": {"checkbox": True}}
-    if drive_url:
-        properties["Drive URL"] = {"url": drive_url}
-    notion.pages.update(page_id, properties=properties)
-
-
-def update_interaction_fields(page_id: str, fields: dict):
-    """
-    Write enriched CRM fields back to an INTERACTIONS entry.
-
-    fields keys (all optional):
-        date      str  — YYYY-MM-DD
-        type      str  — must match a Type select option
-        stage     str  — must match a Stage at Time select option
-        crm_note  str  — text for the Notes field
-    """
-    notion = _client()
-    properties: dict = {}
-
-    if fields.get("date"):
-        properties["Date"] = {"date": {"start": fields["date"]}}
-
-    if fields.get("type"):
-        properties["Type"] = {"select": {"name": fields["type"]}}
-
-    if fields.get("stage"):
-        properties["Stage at Time"] = {"select": {"name": fields["stage"]}}
-
-    if fields.get("crm_note"):
-        properties["Notes"] = {
-            "rich_text": [{"type": "text", "text": {"content": fields["crm_note"]}}]
-        }
-
-    if properties:
-        notion.pages.update(page_id, properties=properties)
+    return "\n".join(lines)
