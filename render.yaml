@@ -14,9 +14,5 @@ services:
         # JSON: {"<db_id_no_dashes>": {"api_key": "secret_...", "name": "Jon"}, ...}
       - key: GOOGLE_DRIVE_FOLDER_ID
         sync: false
-      - key: GOOGLE_OAUTH_CLIENT_ID
-        sync: false
-      - key: GOOGLE_OAUTH_CLIENT_SECRET
-        sync: false
-      - key: GOOGLE_OAUTH_REFRESH_TOKEN
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false

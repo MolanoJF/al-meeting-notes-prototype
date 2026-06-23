@@ -1,32 +1,24 @@
 """
-Uploads a Word doc to Google Drive using OAuth user credentials.
+Uploads a Word doc to Google Drive using a Service Account.
 
 Requires:
-  GOOGLE_OAUTH_CLIENT_ID       — OAuth client ID
-  GOOGLE_OAUTH_CLIENT_SECRET   — OAuth client secret
-  GOOGLE_OAUTH_REFRESH_TOKEN   — long-lived refresh token
+  GOOGLE_SERVICE_ACCOUNT_JSON  — full service account JSON (as string)
   GOOGLE_DRIVE_FOLDER_ID       — Drive folder ID to upload into
 """
 
+import json
 import os
 
-from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 _SCOPES = ["https://www.googleapis.com/auth/drive"]
-_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
 def _get_drive_service():
-    creds = Credentials(
-        token=None,
-        refresh_token=os.environ["GOOGLE_OAUTH_REFRESH_TOKEN"],
-        token_uri=_TOKEN_URI,
-        client_id=os.environ["GOOGLE_OAUTH_CLIENT_ID"],
-        client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
-        scopes=_SCOPES,
-    )
+    sa_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=_SCOPES)
     return build("drive", "v3", credentials=creds)
 
 
@@ -55,11 +47,16 @@ def upload_to_drive(local_path: str, filename: str, folder_id: str | None = None
         )
         uploaded = (
             service.files()
-            .create(body=file_metadata, media_body=media, fields="id,webViewLink")
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
             .execute()
         )
         url = uploaded.get("webViewLink", "")
-        print(f"[drive] Uploaded: {filename} → {url}")
+        print(f"[drive] Uploaded: {filename} -> {url}")
     except Exception as e:
         print(f"[drive] Upload failed: {e}")
     finally:
